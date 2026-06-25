@@ -1,0 +1,597 @@
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>DWSD — Catch Basin Review</title>
+
+<!-- ========================================================================
+  DWSD Task 03 — Catch Basin GIS-analyst review app
+  Flow: click a point -> live Mapillary image opens -> Approve/Reject
+        -> review_status is written to the feature service -> Next loads the
+        next pending point.
+  ArcGIS Online PRIVATE layer: the user signs in with their own credentials
+  (IdentityManager prompts automatically on first access to the secured layer).
+  Mapillary token sits inline below (not published anywhere public).
+========================================================================= -->
+
+<!-- Mapillary viewer — MUST be loaded BEFORE the ArcGIS API. mapillary-js is a
+     UMD bundle: if it loads after ArcGIS (which installs Dojo's AMD `define`),
+     it registers into Dojo's loader and corrupts it -> "multipleDefine" /
+     "Map is not a constructor". Loading it first makes it attach to
+     window.mapillary instead. -->
+<link rel="stylesheet" href="https://unpkg.com/mapillary-js@4.1.2/dist/mapillary.css"/>
+<script src="https://unpkg.com/mapillary-js@4.1.2/dist/mapillary.js"></script>
+<!-- pbf: decode the base64 Mapbox-vector-tile detection geometry in-browser -->
+<script src="https://unpkg.com/pbf@3.2.1/dist/pbf.js"></script>
+<!-- ArcGIS Maps SDK for JS -->
+<link rel="stylesheet" href="https://js.arcgis.com/4.30/esri/themes/light/main.css"/>
+<script src="https://js.arcgis.com/4.30/"></script>
+
+<style>
+  html,body{margin:0;height:100%;font:14px/1.4 system-ui,Segoe UI,Roboto,Arial,sans-serif}
+  #app{display:flex;height:100vh}
+  #viewDiv{flex:1;min-width:0}
+  #panel{flex:1.25;min-width:520px;display:flex;flex-direction:column;border-right:1px solid #d0d5da;background:#fff;position:relative}
+  #bar{padding:10px 14px;background:#13344d;color:#fff;display:flex;justify-content:space-between;align-items:center}
+  #bar b{font-size:15px}
+  #menuBtn{background:transparent;border:0;color:#fff;font-size:22px;line-height:1;cursor:pointer;padding:0 8px;border-radius:8px}
+  #menuBtn:hover{background:#27618c}
+  #menu{position:absolute;top:42px;right:14px;z-index:50;background:#fff;border:1px solid #ccd3da;border-radius:8px;box-shadow:0 6px 22px rgba(0,0,0,.18);padding:6px;display:none;min-width:170px}
+  #menu.open{display:block}
+  #menu button{display:block;width:100%;text-align:left;padding:9px 10px;border:0;background:none;font-size:13px;cursor:pointer;border-radius:6px;color:#16242e}
+  #menu button:hover{background:#eef2f6}
+  #mly{flex:1;min-height:420px;background:#000;position:relative}
+  #mlyMsg{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#aaa;text-align:center;padding:16px}
+  #attrs{padding:10px 14px;font-size:13px;border-bottom:1px solid #eee;max-height:150px;overflow:auto}
+  #attrs div{display:flex;justify-content:space-between;gap:10px;padding:2px 0}
+  #attrs span:first-child{color:#667;}
+  #attrs span:last-child{font-weight:600;text-align:right;word-break:break-all}
+  #btns{padding:12px 14px;display:grid;grid-template-columns:1fr 1fr;gap:8px}
+  #btns button{padding:12px;border:0;border-radius:8px;font-size:14px;font-weight:700;cursor:pointer;color:#fff}
+  .approve{background:#2e7d32}.reject{background:#c62828}.field{background:#1565c0}.next{background:#555}
+  #btns button:disabled{opacity:.5;cursor:default}
+  #help{padding:8px 14px;color:#889;font-size:11.5px;border-top:1px solid #eee}
+  #status{padding:6px 14px;font-size:12px;color:#456;min-height:18px}
+  .chip{display:inline-block;padding:1px 8px;border-radius:10px;font-size:11px;color:#fff}
+  /* dashboard */
+  #dash{position:fixed;inset:0;background:rgba(10,20,30,.5);display:none;align-items:center;justify-content:center;z-index:1000}
+  #dash.open{display:flex}
+  #dashPanel{background:#fff;width:min(880px,92vw);max-height:88vh;overflow:auto;border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.35)}
+  #dashHead{display:flex;justify-content:space-between;align-items:center;padding:13px 18px;background:#13344d;color:#fff;border-radius:12px 12px 0 0;position:sticky;top:0}
+  #dashHead b{font-size:16px}
+  #dashClose{background:transparent;border:0;color:#fff;font-size:24px;line-height:1;cursor:pointer;padding:0 6px}
+  #dashBody{padding:18px}
+  .dsummary{display:flex;gap:14px;margin-bottom:22px;flex-wrap:wrap}
+  .dcard{flex:1;min-width:120px;background:#f5f7f9;border:1px solid #e3e8ec;border-radius:10px;padding:12px 14px}
+  .dcard .n{font-size:26px;font-weight:800;letter-spacing:-.02em}
+  .dcard .l{font-size:12px;color:#667;text-transform:uppercase;letter-spacing:.05em}
+  .dsec{margin-bottom:24px}
+  .dsec h3{margin:0 0 10px;font-size:12.5px;text-transform:uppercase;letter-spacing:.06em;color:#566}
+  .drow{display:flex;align-items:center;gap:10px;margin:5px 0;font-size:13px}
+  .dlab{width:92px;color:#445;text-align:right;flex:none;text-transform:capitalize}
+  .dbar{height:18px;border-radius:4px;min-width:2px}
+  .dstack{display:flex;height:20px;border-radius:4px;overflow:hidden;flex:1;background:#eef1f3}
+  .dstack span{display:block;height:100%}
+  .dval{font-variant-numeric:tabular-nums;color:#333;font-weight:600;flex:none;width:64px}
+  .dlegend{display:flex;flex-wrap:wrap;gap:14px;font-size:11.5px;color:#667;margin-top:10px}
+  .dlegend i{display:inline-block;width:11px;height:11px;border-radius:3px;margin-right:5px;vertical-align:-1px}
+  .dcounts{margin:3px 0 12px 102px;display:flex;flex-wrap:wrap;gap:6px}
+  .dc{font-size:11px;color:#fff;padding:1px 8px;border-radius:9px;white-space:nowrap}
+</style>
+
+<div id="app">
+  <div id="panel">
+    <div id="bar"><b>Catch Basin Review</b><button id="menuBtn" title="Menu">⋯</button></div>
+    <div id="menu"><button id="miAddLayer">➕ Add layer…</button><button id="miDefQuery">🔎 Definition query…</button><button id="miDash">📊 Dashboard</button></div>
+    <div id="mly"><div id="mlyMsg">Select a point…</div></div>
+    <div id="attrs"></div>
+    <div id="btns">
+      <button class="approve" id="bApprove" disabled>✓ Approve (A)</button>
+      <button class="reject"  id="bReject"  disabled>✕ Reject (R)</button>
+      <button class="field"   id="bField"   disabled>⚑ Field check (F)</button>
+      <button class="next"    id="bNext"    disabled>→ Next (N)</button>
+    </div>
+    <div id="status"></div>
+    <div id="help">Keys: <b>A</b> approve · <b>R</b> reject · <b>F</b> field · <b>N</b> next.<br>
+      Reviewed: <span class="chip" style="background:#2e7d32">approved</span>
+      <span class="chip" style="background:#c62828">rejected</span>
+      <span class="chip" style="background:#1565c0">field</span><br>
+      Pending by confidence:
+      <span class="chip" style="background:#fb8c00">high</span>
+      <span class="chip" style="background:#fdd835;color:#333">medium</span>
+      <span class="chip" style="background:#b0bec5;color:#333">low</span>
+      <span class="chip" style="background:#00897b">existing</span>
+      <span class="chip" style="background:#9e9e9e">unscored</span></div>
+  </div>
+  <div id="viewDiv"></div>
+</div>
+
+<div id="dash">
+  <div id="dashPanel">
+    <div id="dashHead"><b>Review Dashboard</b><button id="dashClose" title="Close">×</button></div>
+    <div id="dashBody">Loading…</div>
+  </div>
+</div>
+
+<script>
+/* ============================ CONFIG — FILL IN ============================ */
+const CONFIG = {
+  // ArcGIS Online (private) — user signs in via the ArcGIS OAuth page (redirect).
+  portalUrl:       "https://detroitmi.maps.arcgis.com",   // org URL for SSO, e.g. https://YOURORG.maps.arcgis.com
+  oauthAppId:      "tUEA1S6uNsxF7plC",            // Client ID of an OAuth app registered in AGOL
+  featureLayerUrl: "https://services2.arcgis.com/qvkbeam7Wirps6zC/arcgis/rest/services/catch_basins_mapillary/FeatureServer/0",
+
+  // Mapillary access token (MLY|...). Kept inline; do not publish publicly.
+  mapillaryToken:  "MLY|27480915378216463|81eed959d097fdaf0dd7875ac3e875c5",
+
+  // Field names (match the actual fields in your feature service)
+  fields: {
+    // OID is auto-detected from layer.objectIdField (e.g. OBJECTID) — no need to set it.
+    mapFeatureId: "id",            // Mapillary map_feature id (the 'id' from catch_basins.csv)
+    reviewStatus: "review_status", // editable; pending/approved/rejected/field_check
+    confidence:   "confidence",    // our computed confidence score
+    reviewer:     "reviewer",      // optional (leave "" if absent)
+    reviewDate:   "review_date",   // optional
+    reviewNote:   "review_note"    // optional
+  },
+
+  // Status values; null/empty is also treated as pending.
+  status: { pending:"pending", approved:"approved", rejected:"rejected", field:"field_check" },
+};
+/* ====================================================================== */
+
+const F = CONFIG.fields;
+let layer, statsLayer, map, view, viewer, OIDF, current = null, queue = [], qi = -1, username = "";
+
+require([
+  "esri/identity/OAuthInfo", "esri/identity/IdentityManager", "esri/Graphic", "esri/layers/Layer", "esri/geometry/geometryEngine",
+  "esri/Map","esri/views/MapView","esri/layers/FeatureLayer","esri/renderers/UniqueValueRenderer"
+], function(OAuthInfo, esriId, Graphic, Layer, geometryEngine, Map, MapView, FeatureLayer, UVR){
+
+  esriId.on("credential-create", e=>{ if (e.credential) username = e.credential.userId || ""; });
+
+  // OAuth: redirect to the org's ArcGIS sign-in page (supports SSO), then return.
+  // portalUrl MUST be your org URL so the redirect hits your org/SSO login.
+  esriId.registerOAuthInfos([ new OAuthInfo({
+    appId: CONFIG.oauthAppId, portalUrl: CONFIG.portalUrl, popup:false
+  }) ]);
+  const signRes = CONFIG.portalUrl + "/sharing";
+  esriId.checkSignInStatus(signRes).then(start).catch(()=> esriId.getCredential(signRes).then(start));
+
+  function start(){
+    const S = CONFIG.status;
+    layer = new FeatureLayer({
+      url: CONFIG.featureLayerUrl, outFields:["*"],
+      renderer: new UVR({
+        // Reviewed -> decision color; still pending -> confidence-tier color.
+        valueExpression:
+          "var s=$feature." + F.reviewStatus + ";" +
+          "if(s=='" + S.approved + "') return 'Approved';" +
+          "if(s=='" + S.rejected + "') return 'Rejected';" +
+          "if(s=='" + S.field + "') return 'Field check';" +
+          "var raw=$feature." + F.confidence + ";" +
+          "var c=IIf(IsEmpty(raw),'',Lower(raw));" +
+          "if(Find('high',c)>=0 || Find('yüksek',c)>=0) return 'Pending · high';" +
+          "if(Find('med',c)>=0  || Find('orta',c)>=0)   return 'Pending · medium';" +
+          "if(Find('low',c)>=0  || Find('düşük',c)>=0)  return 'Pending · low';" +
+          "if(Find('exist',c)>=0|| Find('mevcut',c)>=0) return 'Pending · existing data';" +
+          "return 'Pending · unscored';",
+        defaultSymbol: sym("#9e9e9e"),
+        uniqueValueInfos: [
+          { value:"Approved",                symbol:sym("#2e7d32") },
+          { value:"Rejected",                symbol:sym("#c62828") },
+          { value:"Field check",             symbol:sym("#1565c0") },
+          { value:"Pending · existing data", symbol:sym("#00897b") },
+          { value:"Pending · high",          symbol:sym("#fb8c00") },
+          { value:"Pending · medium",        symbol:sym("#fdd835") },
+          { value:"Pending · low",           symbol:sym("#b0bec5") },
+          { value:"Pending · unscored",      symbol:sym("#9e9e9e") },
+        ]
+      })
+    });
+
+    // Separate, unfiltered layer instance for the dashboard so its stats stay
+    // independent of any definition query applied to the displayed `layer`.
+    statsLayer = new FeatureLayer({ url: CONFIG.featureLayerUrl });
+
+    map = new Map({ basemap:"streets-navigation-vector", layers:[layer] });
+    view = new MapView({ container:"viewDiv", map });
+
+    layer.when(()=>{
+      OIDF = layer.objectIdField;                 // real OID field (e.g. OBJECTID)
+      view.goTo(layer.fullExtent).catch(()=>{});
+      refreshQueue();
+    });
+
+    view.on("click", (e)=> view.hitTest(e).then(r=>{
+      const g = r.results.find(x=> x.graphic && x.graphic.layer===layer);
+      if (g) showFeature(g.graphic.attributes[OIDF]);
+    }));
+  }
+
+  function sym(color){
+    return { type:"simple-marker", size:9, color:color, outline:{ color:"white", width:1 } };
+  }
+
+  // Pending = review_status null / empty / 'pending'.
+  let remaining = 0;
+  function pendingWhere(){ return `${F.reviewStatus} IS NULL OR ${F.reviewStatus}='' OR ${F.reviewStatus}='${CONFIG.status.pending}'`; }
+  function showCount(){ const el = document.getElementById("count"); if (el) el.textContent = remaining + " left"; }
+
+  // Fetch a batch of pending OIDs (server caps at maxRecordCount, e.g. 1000),
+  // show the first; auto-refills when the batch is exhausted (for 85k features).
+  function refreshQueue(){
+    const w = pendingWhere();
+    const q = { where:w, returnGeometry:false, outFields:[OIDF] };
+    if (hasField(F.confidence)) q.orderByFields = [F.confidence + " DESC"];
+    layer.queryFeatureCount({ where:w }).then(c=>{ remaining = c; showCount(); });
+    layer.queryFeatures(q).then(fs=>{
+      queue = fs.features.map(f=> f.attributes[OIDF]); qi = -1;
+      if (queue.length) showFeature(queue[++qi]);
+      else { setStatusMsg("Queue empty — all reviewed 🎉"); enable(false); }
+    });
+  }
+
+  function hasField(n){ return n && layer.fields.some(f=> f.name.toLowerCase()===n.toLowerCase()); }
+
+  // Show one feature: zoom + panel + Mapillary image.
+  function showFeature(oid){
+    layer.queryFeatures({ objectIds:[oid], returnGeometry:true, outFields:["*"] }).then(fs=>{
+      if (!fs.features.length) return;
+      const f = fs.features[0]; current = f;
+      drawSelected(f.geometry);
+      if (f.geometry) view.goTo({ target:f.geometry, zoom:19 }).catch(()=>{});
+      renderAttrs(f.attributes);
+      enable(true);
+      loadMapillary(f.attributes[F.mapFeatureId]);
+    });
+  }
+
+  function renderAttrs(a){
+    const order = [F.mapFeatureId, F.confidence, F.reviewStatus, "object_value","lon","lat","first_seen_at","last_seen_at"];
+    const seen = {};
+    let h = "";
+    order.forEach(k=>{ if(k && a[k]!==undefined && !seen[k]){ seen[k]=1; h += row(k, a[k]); }});
+    document.getElementById("attrs").innerHTML = h;
+  }
+  function row(k,v){ return `<div><span>${k}</span><span>${v==null?"—":v}</span></div>`; }
+
+  // Mapillary: map_feature id -> an image that detected it -> viewer; then turn
+  // the camera to the detection and outline it.
+  const MLY = "https://graph.mapillary.com";
+  function loadMapillary(featureId){
+    if (!featureId){ showMsg("No Mapillary id on this point"); return; }
+    showMsg("Loading image…");
+    fetch(`${MLY}/${featureId}?fields=images&access_token=${CONFIG.mapillaryToken}`)
+      .then(r=> r.json())
+      .then(d=>{
+        const imgId = d && d.images && d.images.data && d.images.data[0] && d.images.data[0].id;
+        if (!imgId){ showMsg("No image found for this feature"); return; }
+        hideMsg();
+        if (!viewer){
+          viewer = new mapillary.Viewer({
+            accessToken:CONFIG.mapillaryToken, container:"mly", imageId:imgId,
+            component:{ tag:true }            // activate tag component (off by default) so outlines draw
+          });
+          // 'image' fires whenever the shown image is ready (first load + every move)
+          viewer.on("image", e=> highlightDetection((e.image && (e.image.id || e.image.key)) || imgId));
+          // Rotate the cone with manual pan / zoom. After each image loads we briefly
+          // ignore the auto-fired bearing so the initial camera->basin direction
+          // (set in highlightDetection) isn't immediately overwritten.
+          viewer.on("image", ()=>{ coneLive=false; clearTimeout(coneTimer); coneTimer=setTimeout(()=>{coneLive=true;}, 900); });
+          viewer.on("bearing", e=>{ if (coneLive && e.bearing!=null){ camBearing=e.bearing; drawCone(); } });
+          try { viewer.on("fov", e=>{ if (e.fov!=null){ camFov=e.fov; drawCone(); } }); } catch(_){}
+        } else {
+          viewer.moveTo(imgId).catch(()=> showMsg("Could not open image"));
+        }
+      })
+      .catch(()=> showMsg("Mapillary request failed (token?)"));
+  }
+
+  // Selected catch-basin point on the map (bright halo).
+  let extraGfx = [], camLngLat = null, camBearing = 0, camFov = 60, coneLive = false, coneTimer = null;
+  function drawSelected(geom){
+    view.graphics.removeAll(); extraGfx = []; camLngLat = null;
+    if (!geom) return;
+    view.graphics.add(new Graphic({ geometry:geom, symbol:{
+      type:"simple-marker", style:"circle", size:26, color:[0,0,0,0],
+      outline:{ color:"#00e5ff", width:3 } } }));
+  }
+
+  // Destination [lng,lat] given a start, bearing (deg from N) and distance (m).
+  function dest(lat, lon, brg, d){
+    const R=6378137, br=brg*Math.PI/180, dr=d/R;
+    const la1=lat*Math.PI/180, lo1=lon*Math.PI/180;
+    const la2=Math.asin(Math.sin(la1)*Math.cos(dr)+Math.cos(la1)*Math.sin(dr)*Math.cos(br));
+    const lo2=lo1+Math.atan2(Math.sin(br)*Math.sin(dr)*Math.cos(la1), Math.cos(dr)-Math.sin(la1)*Math.sin(la2));
+    return [lo2*180/Math.PI, la2*180/Math.PI];
+  }
+
+  // Initial bearing (deg from N) from point 1 to point 2.
+  function bearingTo(lat1, lon1, lat2, lon2){
+    const a1=lat1*Math.PI/180, a2=lat2*Math.PI/180, dl=(lon2-lon1)*Math.PI/180;
+    const y=Math.sin(dl)*Math.cos(a2);
+    const x=Math.cos(a1)*Math.sin(a2)-Math.sin(a1)*Math.cos(a2)*Math.cos(dl);
+    return (Math.atan2(y,x)*180/Math.PI + 360) % 360;
+  }
+
+  // Street-View style view-cone on the map: apex at camera, pointing along the
+  // current bearing, half-angle = fov/2 (so it widens out / narrows in on zoom).
+  function drawCone(){
+    extraGfx.forEach(g=> view.graphics.remove(g)); extraGfx = [];
+    if (!camLngLat) return;
+    const [lng, lat] = camLngLat;
+    const half = Math.max(8, Math.min(40, (camFov||60)/2)), R = 35, N = 14;
+    const ring = [[lng, lat]];
+    for (let i=0;i<=N;i++) ring.push(dest(lat, lng, camBearing - half + 2*half*(i/N), R));
+    ring.push([lng, lat]);
+    const cone = new Graphic({ geometry:{ type:"polygon", rings:[ring], spatialReference:{wkid:4326} },
+      symbol:{ type:"simple-fill", color:[255,204,0,0.22], outline:{ color:[255,170,0,0.95], width:1.5 } } });
+    const cam = new Graphic({ geometry:{ type:"point", longitude:lng, latitude:lat },
+      symbol:{ type:"simple-marker", style:"diamond", size:12, color:"#ffcc00", outline:{ color:"white", width:1 } } });
+    extraGfx = [cone, cam]; view.graphics.addMany(extraGfx);
+  }
+
+  // Fetch the catch-basin detection in this image: center+outline it on the
+  // photo, AND draw the camera position + sight-line to the basin on the map.
+  function highlightDetection(imageId){
+    try { clearTags(); } catch(_) {}
+    // (a) photo: detection outline + recenter
+    fetch(`${MLY}/${imageId}/detections?fields=value,geometry&access_token=${CONFIG.mapillaryToken}`)
+      .then(r=> r.json())
+      .then(d=>{
+        const det = (d.data||[]).find(x=> x.value==="object--catch-basin") || (d.data||[])[0];
+        console.log("[mly] detections:", (d.data||[]).length, "| catch-basin det:", !!det, "| Pbf:", !!window.Pbf);
+        if (!det || !det.geometry || !window.Pbf) return;
+        const poly = decodeDetection(det.geometry);
+        console.log("[mly] decoded polygon points:", poly && poly.length, poly && poly[0]);
+        if (!poly || poly.length < 3) return;
+        const cx = poly.reduce((s,p)=>s+p[0],0)/poly.length;
+        const cy = poly.reduce((s,p)=>s+p[1],0)/poly.length;
+        console.log("[mly] center (basic):", cx.toFixed(3), cy.toFixed(3));
+        try { viewer.setCenter([cx, cy]); viewer.setZoom(1.4); } catch(e){ console.warn("setCenter", e); }
+        drawTag(poly);
+      })
+      .catch(e=> console.warn("[mly] detection fetch failed", e));
+    // (b) map: camera position + view-cone (only needs camera lng/lat + bearing).
+    fetch(`${MLY}/${imageId}?fields=computed_geometry,geometry,computed_compass_angle,compass_angle&access_token=${CONFIG.mapillaryToken}`)
+      .then(r=> r.json())
+      .then(im=>{
+        const c = ((im.computed_geometry||im.geometry||{}).coordinates)||null;
+        if (!c) return;
+        camLngLat = c;
+        // Point the cone from the camera toward the basin (deterministic geographic
+        // bearing) so it always covers the basin and never drifts.
+        const a = current ? current.attributes : {};
+        const blon = (a.lon!=null) ? a.lon : (current && current.geometry && current.geometry.longitude);
+        const blat = (a.lat!=null) ? a.lat : (current && current.geometry && current.geometry.latitude);
+        if (blon!=null && blat!=null) camBearing = bearingTo(c[1], c[0], blat, blon);
+        else { const ca=(im.computed_compass_angle!=null)?im.computed_compass_angle:im.compass_angle; if(ca!=null) camBearing=ca; }
+        drawCone();
+      })
+      .catch(()=>{});
+  }
+
+  function clearTags(){ const t=viewer.getComponent("tag"); if(t&&t.removeAll) t.removeAll(); }
+  function drawTag(poly){
+    try {
+      const tagC = viewer.getComponent("tag");
+      const ring = poly.slice(); if (ring[0]+""!==ring[ring.length-1]+"") ring.push(ring[0]);
+      const geom = new mapillary.PolygonGeometry(ring);
+      const tag = new mapillary.OutlineTag("cb", geom,
+        { lineColor:0xffcc00, lineWidth:3, fillColor:0xffcc00, fillOpacity:0.25 });
+      tagC.add([tag]);
+    } catch(_) {}
+  }
+
+  // Decode a base64 Mapbox-vector-tile detection into a polygon in mapillary
+  // "basic" image coords ([0..1], origin top-left). The detection MVT here is
+  // y-DOWN (same as basic), so basic = [x/extent, y/extent] with NO flip.
+  function decodeDetection(b64){
+    const bytes = Uint8Array.from(atob(b64), c=> c.charCodeAt(0));
+    const pbf = new Pbf(bytes);
+    let layer = null;
+    pbf.readFields((tag,_,p)=>{ if (tag===3) layer = p.readMessage(readLayer, {extent:4096, geoms:[]}); }, {});
+    if (!layer || !layer.geoms.length) return null;
+    const ext = layer.extent || 4096;
+    const pts = layer.geoms[0];                    // first feature's ring
+    return pts.map(([x,y])=> [x/ext, y/ext]);
+    function readLayer(tag, l, p){
+      if (tag===5) l.extent = p.readVarint();
+      else if (tag===2){ const f={cmds:[]}; p.readMessage(readFeat, f); if(f.cmds.length) l.geoms.push(cmdsToRing(f.cmds)); }
+    }
+    function readFeat(tag, f, p){ if (tag===4) f.cmds = p.readPackedVarint(); }
+  }
+  function cmdsToRing(g){
+    const ring=[]; let x=0,y=0,i=0;
+    const zz = n=> (n>>1) ^ (-(n&1));
+    while (i < g.length){
+      const cl=g[i++], cmd=cl&7, len=cl>>3;
+      if (cmd===1 || cmd===2){ for(let j=0;j<len;j++){ x+=zz(g[i++]); y+=zz(g[i++]); ring.push([x,y]); } }
+      else if (cmd===7){ /* close */ }
+    }
+    return ring;
+  }
+
+  function showMsg(t){ const m=document.getElementById("mlyMsg"); m.style.display="flex"; m.textContent=t; }
+  function hideMsg(){ document.getElementById("mlyMsg").style.display="none"; }
+
+  // Write the review decision back to the feature service.
+  function setStatus(val){
+    if (!current) return;
+    const oid = current.attributes[OIDF];
+    const attrs = { [OIDF]: oid, [F.reviewStatus]: val };
+    if (hasField(F.reviewer) && username) attrs[F.reviewer] = username;
+    if (hasField(F.reviewDate)) attrs[F.reviewDate] = Date.now();
+    setStatusMsg("Saving…");
+    layer.applyEdits({ updateFeatures:[{ attributes:attrs }] }).then(res=>{
+      const r = res.updateFeatureResults[0];
+      if (r.error){ setStatusMsg("ERROR: " + r.error.message); return; }
+      setStatusMsg(`${oid} → ${val}`);
+      remaining = Math.max(0, remaining - 1); showCount();
+      layer.refresh();
+      next();
+    }).catch(e=> setStatusMsg("applyEdits error: " + e.message));
+  };
+
+  // Go to the NEAREST pending feature to the current one (expanding search).
+  function next(){
+    if (!current || !current.geometry){ refreshQueue(); return; }
+    const curOid = current.attributes[OIDF], here = current.geometry;
+    const radii = [300, 1500, 8000, 50000, null];   // meters; null = whole dataset
+    let i = 0;
+    (function tryR(){
+      const q = { where:`(${pendingWhere()}) AND ${OIDF}<>${curOid}`,
+                  returnGeometry:true, outFields:[OIDF], num:250 };
+      if (radii[i]!=null){ q.geometry=here; q.spatialRelationship="intersects"; q.distance=radii[i]; q.units="meters"; }
+      layer.queryFeatures(q).then(fs=>{
+        const cands = fs.features.filter(f=> f.geometry);
+        if (!cands.length){
+          if (i < radii.length-1){ i++; tryR(); }
+          else { setStatusMsg("Queue empty — all reviewed 🎉"); enable(false); }
+          return;
+        }
+        let best=null, bd=Infinity;
+        for (const f of cands){
+          const d = geometryEngine.distance(here, f.geometry, "meters");
+          if (d!=null && d<bd){ bd=d; best=f; }
+        }
+        showFeature((best||cands[0]).attributes[OIDF]);
+      }).catch(()=> setStatusMsg("nearest query failed"));
+    })();
+  }
+
+  function enable(on){ ["bApprove","bReject","bField","bNext"].forEach(id=> document.getElementById(id).disabled=!on); }
+  function setStatusMsg(t){ document.getElementById("status").textContent = t; }
+
+  // "…" menu: add operational layers (kept below our review layer).
+  const menu = document.getElementById("menu");
+  document.getElementById("menuBtn").onclick = (e)=>{ e.stopPropagation(); menu.classList.toggle("open"); };
+  document.addEventListener("click", e=>{ if (!menu.contains(e.target) && e.target.id!=="menuBtn") menu.classList.remove("open"); });
+  document.getElementById("miAddLayer").onclick = ()=>{
+    menu.classList.remove("open");
+    const url = prompt("Layer URL (FeatureServer / MapServer / ImageServer):");
+    if (!url) return;
+    setStatusMsg("Adding layer…");
+    Layer.fromArcGISServerUrl({ url: url.trim() }).then(lyr=>{
+      map.add(lyr);
+      keepReviewOnTop();
+      setStatusMsg("Layer added: " + (lyr.title || lyr.type));
+    }).catch(err=> setStatusMsg("Add layer failed: " + (err.message || err)));
+  };
+  // Our review layer must always stay on top of any added layers.
+  function keepReviewOnTop(){ if (layer && map) map.reorder(layer, map.layers.length - 1); }
+
+  // Definition query: filter the DISPLAYED layer (and the review queue) only.
+  // The dashboard uses statsLayer (unfiltered), so it is unaffected.
+  document.getElementById("miDefQuery").onclick = ()=>{
+    menu.classList.remove("open");
+    const cur = layer.definitionExpression || "";
+    const expr = prompt("Definition query (SQL WHERE, e.g. confidence='high'). Empty = show all:", cur);
+    if (expr === null) return;                       // cancelled
+    layer.definitionExpression = expr.trim() || null;
+    setStatusMsg(expr.trim() ? ("Filter: " + expr.trim()) : "Filter cleared");
+    current = null; queue = []; qi = -1;             // reset queue, then load first match
+    refreshQueue();
+  };
+
+  // ----- Dashboard (stats popup) -----
+  const dash = document.getElementById("dash");
+  const dashBody = document.getElementById("dashBody");
+  document.getElementById("miDash").onclick = ()=>{ menu.classList.remove("open"); openDashboard(); };
+  document.getElementById("dashClose").onclick = ()=> dash.classList.remove("open");
+  dash.addEventListener("click", e=>{ if (e.target===dash) dash.classList.remove("open"); });
+
+  const SS = CONFIG.status;
+  const ST_ORDER = [SS.approved, SS.rejected, SS.field, SS.pending];
+  const ST_COL = { [SS.approved]:"#2e7d32", [SS.rejected]:"#c62828", [SS.field]:"#1565c0", [SS.pending]:"#e8a33d" };
+  const ST_LBL = { [SS.approved]:"approved", [SS.rejected]:"rejected", [SS.field]:"field check", [SS.pending]:"pending" };
+  function stCol(s){ return ST_COL[s] || "#7e57c2"; }   // unknown status -> purple
+  function stLbl(s){ return ST_LBL[s] || s; }
+  const CONF_ORDER = ["high","medium","low","existing","unscored"];
+  const CONF_COL = { high:"#fb8c00", medium:"#fdd835", low:"#b0bec5", existing:"#00897b", unscored:"#9e9e9e" };
+
+  function confTier(v){
+    if (v==null) return "unscored";
+    const c = (""+v).toLowerCase();
+    if (c.indexOf("high")>=0 || c.indexOf("yüksek")>=0) return "high";
+    if (c.indexOf("med")>=0  || c.indexOf("orta")>=0)   return "medium";
+    if (c.indexOf("low")>=0  || c.indexOf("düşük")>=0)  return "low";
+    if (c.indexOf("exist")>=0|| c.indexOf("mevcut")>=0) return "existing";
+    return "unscored";
+  }
+  function statusCat(v){ return (v==null || v==="") ? SS.pending : v; }
+
+  // Server-side grouped count.
+  function statCount(groupFields){
+    return statsLayer.queryFeatures({ where:"1=1", returnGeometry:false,
+      groupByFieldsForStatistics: groupFields,
+      outStatistics:[{ statisticType:"count", onStatisticField: OIDF, outStatisticFieldName:"cnt" }]
+    }).then(fs=> fs.features.map(f=> f.attributes));
+  }
+
+  function openDashboard(){
+    dash.classList.add("open");
+    dashBody.innerHTML = "Loading…";
+    Promise.all([ statCount([F.confidence]), statCount([F.reviewStatus]), statCount([F.confidence, F.reviewStatus]) ])
+      .then(([cRows, sRows, xRows])=>{
+        const conf={}, stat={}, matrix={};
+        cRows.forEach(a=>{ const t=confTier(a[F.confidence]); conf[t]=(conf[t]||0)+(a.cnt||0); });
+        sRows.forEach(a=>{ const s=statusCat(a[F.reviewStatus]); stat[s]=(stat[s]||0)+(a.cnt||0); });
+        xRows.forEach(a=>{ const t=confTier(a[F.confidence]), s=statusCat(a[F.reviewStatus]);
+          (matrix[t]=matrix[t]||{}); matrix[t][s]=(matrix[t][s]||0)+(a.cnt||0); });
+        // Use whatever statuses actually exist (known ones first, then any extras).
+        const known = [SS.approved, SS.rejected, SS.field, SS.pending];
+        const present = new Set(); sRows.forEach(a=> present.add(statusCat(a[F.reviewStatus])));
+        const statusOrder = known.filter(k=> present.has(k))
+          .concat([...present].filter(s=> !known.includes(s)).sort());
+        const total = sRows.reduce((s,a)=> s+(a.cnt||0), 0);
+        const pending = stat[SS.pending]||0, reviewed = total - pending;
+        const pct = total ? Math.round(100*reviewed/total) : 0;
+        dashBody.innerHTML =
+          cards([["Total", total], ["Reviewed", reviewed], ["Pending", pending], ["% done", pct+"%"]]) +
+          barChart("By confidence", conf, k=> CONF_COL[k]||"#9e9e9e", CONF_ORDER, k=> k) +
+          barChart("By review status", stat, k=> stCol(k), statusOrder, k=> stLbl(k)) +
+          crossChart(matrix, statusOrder);
+      })
+      .catch(e=> dashBody.innerHTML = "Stats query failed: " + (e.message||e));
+  }
+
+  function cards(items){
+    return `<div class="dsummary">` + items.map(([l,v])=>
+      `<div class="dcard"><div class="n">${typeof v==="number" ? v.toLocaleString() : v}</div><div class="l">${l}</div></div>`).join("") + `</div>`;
+  }
+  function barChart(title, data, col, order, lbl){
+    const max = Math.max(1, ...order.map(k=> data[k]||0));
+    const rows = order.map(k=>{ const v=data[k]||0;
+      return `<div class="drow"><span class="dlab">${lbl(k)}</span><div class="dbar" style="width:${100*v/max}%;background:${col(k)}"></div><span class="dval">${v.toLocaleString()}</span></div>`;
+    }).join("");
+    return `<div class="dsec"><h3>${title}</h3>${rows}</div>`;
+  }
+  function crossChart(matrix, statusOrder){
+    const rows = CONF_ORDER.map(t=>{
+      const tot = statusOrder.reduce((s,st)=> s+((matrix[t]&&matrix[t][st])||0), 0);
+      if (!tot) return "";
+      const segs = statusOrder.map(st=>{ const v=(matrix[t]&&matrix[t][st])||0; if(!v) return "";
+        return `<span title="${t} / ${stLbl(st)}: ${v}" style="width:${100*v/tot}%;background:${stCol(st)}"></span>`; }).join("");
+      const chips = statusOrder.map(st=>{ const v=(matrix[t]&&matrix[t][st])||0; if(!v) return "";
+        return `<span class="dc" style="background:${stCol(st)}">${stLbl(st)}: ${v.toLocaleString()}</span>`; }).join("");
+      return `<div class="drow"><span class="dlab">${t}</span><div class="dstack">${segs}</div><span class="dval">${tot.toLocaleString()}</span></div>`
+           + `<div class="dcounts">${chips}</div>`;
+    }).join("");
+    return `<div class="dsec"><h3>Confidence × review status</h3>${rows}</div>`;
+  }
+
+  // Buttons + keyboard shortcuts.
+  document.getElementById("bApprove").onclick = ()=> setStatus(CONFIG.status.approved);
+  document.getElementById("bReject").onclick  = ()=> setStatus(CONFIG.status.rejected);
+  document.getElementById("bField").onclick   = ()=> setStatus(CONFIG.status.field);
+  document.getElementById("bNext").onclick     = ()=> next();
+  document.addEventListener("keydown", e=>{
+    if (e.target.tagName==="INPUT"||e.target.tagName==="TEXTAREA") return;
+    const k = e.key.toLowerCase();
+    if (k==="a") setStatus(CONFIG.status.approved);
+    else if (k==="r") setStatus(CONFIG.status.rejected);
+    else if (k==="f") setStatus(CONFIG.status.field);
+    else if (k==="n"||e.key==="ArrowRight") next();
+  });
+});
+</script>
