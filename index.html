@@ -214,12 +214,16 @@ require([
   // Pending = review_status null / empty / 'pending'.
   let remaining = 0;
   function pendingWhere(){ return `${F.reviewStatus} IS NULL OR ${F.reviewStatus}='' OR ${F.reviewStatus}='${CONFIG.status.pending}'`; }
+  // Fold the active definition query into a where clause so the review queue and
+  // Next honor the same filter as the map display (queryFeatures would otherwise
+  // walk features hidden by the definition query).
+  function withFilter(where){ const def = layer.definitionExpression; return def ? `(${def}) AND (${where})` : where; }
   function showCount(){ const el = document.getElementById("count"); if (el) el.textContent = remaining + " left"; }
 
   // Fetch a batch of pending OIDs (server caps at maxRecordCount, e.g. 1000),
   // show the first; auto-refills when the batch is exhausted (for 85k features).
   function refreshQueue(){
-    const w = pendingWhere();
+    const w = withFilter(pendingWhere());
     const q = { where:w, returnGeometry:false, outFields:[OIDF] };
     if (hasField(F.confidence)) q.orderByFields = [F.confidence + " DESC"];
     layer.queryFeatureCount({ where:w }).then(c=>{ remaining = c; showCount(); });
@@ -439,7 +443,7 @@ require([
     const radii = [300, 1500, 8000, 50000, null];   // meters; null = whole dataset
     let i = 0;
     (function tryR(){
-      const q = { where:`(${pendingWhere()}) AND ${OIDF}<>${curOid}`,
+      const q = { where: withFilter(`(${pendingWhere()}) AND ${OIDF}<>${curOid}`),
                   returnGeometry:true, outFields:[OIDF], num:250 };
       if (radii[i]!=null){ q.geometry=here; q.spatialRelationship="intersects"; q.distance=radii[i]; q.units="meters"; }
       layer.queryFeatures(q).then(fs=>{
